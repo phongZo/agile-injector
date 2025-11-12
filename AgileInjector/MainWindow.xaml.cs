@@ -28,15 +28,18 @@ namespace AgileInjector
             {
                 Unkillable.UnkillableInit();
             }
+            DebugLog.Write("", false); 
+            DebugLog.Write("---------------------------------", false);
+            DebugLog.Write("AgileInjector Client Version " + System.Windows.Forms.Application.ProductVersion);
 
-            _ = Task.Run(() => IpcHandler.Instance.StartServer());
+            Task.Run(() => IpcHandler.Instance.StartServer());
         }
 
         private static void HandleCheckAgentRunning()
         {
             if (IpcHandler.Instance.AgileMarkProcessId.HasValue)
             {
-                try { _ = Process.GetProcessById(IpcHandler.Instance.AgileMarkProcessId.Value); }
+                try { Process.GetProcessById(IpcHandler.Instance.AgileMarkProcessId.Value); }
                 catch
                 {
                     DebugLog.Write("Not found AgileMark -> exit Injector64");
