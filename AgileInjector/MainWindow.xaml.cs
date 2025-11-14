@@ -47,7 +47,6 @@ namespace AgileInjector
                 String folder = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData) + "\\AgileMark\\";
                 Directory.CreateDirectory(folder);
                 DebugLog.PerformFileTrim(folder + "injectorlog.txt");
-                DebugLog.PerformFileTrim(folder + "dlllog.txt");
 
                 // reset 24h
                 LogRotateTimer.Interval = new TimeSpan(24, 0, 0);
