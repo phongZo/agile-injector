@@ -1,8 +1,10 @@
 ﻿using System;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
 
 namespace AgileInjector
 {
@@ -14,6 +16,7 @@ namespace AgileInjector
         public IpcHandler IpcHandler { get; set; } = new IpcHandler();
         public const bool ALLOW_KILLABLE = false;
         private Timer Timer { get; set; } = new Timer(HandleCheckAgentRunning, "DetectAgent");
+        private BackgroundTimer LogRotateTimer;
 
         public MainWindow()
         {
@@ -31,9 +34,30 @@ namespace AgileInjector
             DebugLog.Write("", false); 
             DebugLog.Write("---------------------------------", false);
             DebugLog.Write("AgileInjector Client Version " + System.Windows.Forms.Application.ProductVersion);
+            LogRotateTimer = new BackgroundTimer(LogRotateTimerCallback, "log rotation");
 
             Task.Run(() => IpcHandler.Instance.StartServer());
         }
+        private void LogRotateTimerCallback()
+        {
+            try
+            {
+                DebugLog.WriteLine("Log rotation interval hit");
+
+                String folder = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData) + "\\AgileMark\\";
+                Directory.CreateDirectory(folder);
+                DebugLog.PerformFileTrim(folder + "injectorlog.txt");
+                DebugLog.PerformFileTrim(folder + "dlllog.txt");
+
+                // reset 24h
+                LogRotateTimer.Interval = new TimeSpan(24, 0, 0);
+            }
+            catch (Exception ex)
+            {
+                DebugLog.WriteLine("Error in LogRotateTimerCallback: " + ex.Message);
+            }
+        }
+
 
         private static void HandleCheckAgentRunning()
         {

@@ -280,11 +280,11 @@
       <DependentUpon>App.xaml</DependentUpon>
       <SubType>Code</SubType>
     </Compile>
-    <Compile Include="BackgroundTimer.cs" />
+    <Compile Include="Code\Logs\BackgroundTimer.cs" />
     <Compile Include="Code\Injector\Injector.cs" />
     <Compile Include="Code\IPC\IpcHandler.cs" />
     <Compile Include="Code\Unkillable.cs" />
-    <Compile Include="DebugLog.cs" />
+    <Compile Include="Code\Logs\DebugLog.cs" />
     <Compile Include="MainWindow.xaml.cs">
       <DependentUpon>MainWindow.xaml</DependentUpon>
       <SubType>Code</SubType>
