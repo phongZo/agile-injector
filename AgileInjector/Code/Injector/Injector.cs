@@ -13,7 +13,6 @@ namespace AgileInjector
     public static class Injector
     {
         // ===== Configuration =====
-        private const string DLL_FILE_NAME = "WatermarkOnWindow64.dll";
 
         // ===== Process access =====
         private const uint PROCESS_CREATE_THREAD = 0x0002;
@@ -343,16 +342,13 @@ namespace AgileInjector
 
         [CLSCompliant(false)]
 
-        // =====================================================================
-        // NEW-ONLY API: Inject(pid, hwndTarget)
-        // =====================================================================
-        public static bool Inject(uint pid, IntPtr hwndTarget)
+        public static bool Inject(uint pid, IntPtr hwndTarget, string dllName)
         {
-            DebugLog.WriteLine($"[Inject] Start -> pid={pid}, hwnd=0x{hwndTarget.ToInt64():X}");
+            DebugLog.WriteLine($"[Inject] Start -> pid={pid}, hwnd=0x{hwndTarget.ToInt64():X}, dll={dllName}");
 
             // resolve dll path
             string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            string dllFullPath = Path.Combine(baseDir, DLL_FILE_NAME);
+            string dllFullPath = Path.Combine(baseDir, "x64", dllName);
             string dllFullPathNorm = NormalizeFullPath(dllFullPath);
 
             DebugLog.WriteLine("[Inject] Using co-located DLL: " + dllFullPath);
@@ -466,7 +462,7 @@ namespace AgileInjector
                         return false;
                     }
 
-                    uint wait = WaitForSingleObject(hThreadLoad, INFINITE);
+                    uint wait = WaitForSingleObject(hThreadLoad, 5000); // 5 seconds timeout
                     DebugLog.WriteLine($"[Inject] WaitForSingleObject(LoadLibrary) -> {wait}, tid={tid}");
 
                     if (!GetExitCodeThread(hThreadLoad, out uint exitRaw))
@@ -476,7 +472,11 @@ namespace AgileInjector
                     }
                     else
                     {
-                        DebugLog.WriteLine($"[Inject] LoadLibrary thread exit (DWORD)=0x{exitRaw:X} (ignored on x64)");
+                        DebugLog.WriteLine($"[Inject] LoadLibrary thread exit code: 0x{exitRaw:X}");
+                        if (exitRaw == 0)
+                        {
+                             DebugLog.WriteLine("[Inject][ERROR] LoadLibraryW returned NULL in remote process. DLL might be missing dependencies or corrupted.");
+                        }
                     }
 
                     try { if (hThreadLoad != IntPtr.Zero) { _ = CloseHandle(hThreadLoad); } } catch { }

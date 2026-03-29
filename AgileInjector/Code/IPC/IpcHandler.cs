@@ -7,7 +7,7 @@ namespace AgileInjector
 {
     public static class AgileSharingConstants
     {
-        public const string CMD_INJECT = "CMD_INJECT";
+        public const string CMD_INJECT_DLL = "InjectDLL";
     }
 
     public class DLLMessageWrapper
@@ -16,6 +16,7 @@ namespace AgileInjector
         public int SenderProcessId { get; set; }
         public string TargetProcessId { get; set; }
         public IntPtr TargetHwnd { get; set; }
+        public string DllName { get; set; }
     }
 
     public class IpcHandler
@@ -77,8 +78,7 @@ namespace AgileInjector
                             continue;
                         }
 
-                        // Only handle CMD_INJECT here
-                        if (!string.Equals(msg.CMD, AgileSharingConstants.CMD_INJECT, StringComparison.OrdinalIgnoreCase))
+                        if (!string.Equals(msg.CMD, AgileSharingConstants.CMD_INJECT_DLL, StringComparison.OrdinalIgnoreCase))
                         {
                             DebugLog.WriteLine($"[Injector64.StartServer] Unknown CMD: {msg.CMD}");
                             continue;
@@ -96,11 +96,17 @@ namespace AgileInjector
                         // parse TargetHwnd if provided (supports decimal or hex "0x..." )
                         IntPtr hwndFilter = msg.TargetHwnd;
 
-                        DebugLog.WriteLine($"[Injector64.StartServer] CMD_INJECT received -> targetPid={targetPid}, targetHwnd=0x{hwndFilter.ToInt64():X}");
+                        if (string.IsNullOrEmpty(msg.DllName))
+                        {
+                            DebugLog.WriteLine("[Injector64.StartServer][ERROR] dllName is empty, skipping inject.");
+                            continue;
+                        }
+
+                        DebugLog.WriteLine($"[Injector64.StartServer] CMD_INJECT_DLL received -> targetPid={targetPid}, targetHwnd=0x{hwndFilter.ToInt64():X}, dll={msg.DllName}");
 
                         try
                         {
-                            bool result = Injector.Inject(targetPid, hwndFilter);
+                            bool result = Injector.Inject(targetPid, hwndFilter, msg.DllName);
                             DebugLog.WriteLine(result
                                 ? "[Injector64.StartServer] Inject OK."
                                 : "[Injector64.StartServer] Inject FAILED.");
