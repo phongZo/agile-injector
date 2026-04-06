@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -83,6 +83,14 @@ namespace AgileInjector
         private static extern bool WriteProcessMemory(IntPtr hProc, IntPtr baseAddr, byte[] buffer, uint size, out uint written);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool ReadProcessMemory(
+            IntPtr hProcess,
+            IntPtr lpBaseAddress,
+            [Out] byte[] lpBuffer,
+            int dwSize,
+            out IntPtr lpNumberOfBytesRead);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr CreateRemoteThread(IntPtr hProc, IntPtr lpThreadAttributes, uint dwStackSize,
             IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out uint lpThreadId);
 
@@ -95,8 +103,24 @@ namespace AgileInjector
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool IsWow64Process(IntPtr hProcess, out bool Wow64Process);
 
+        // --- Remote thread diagnostics (QWC wcdc style) ---
+        private const int ThreadBasicInformation = 0;
+        private const int TbiSizeX64 = 0x30;
+        private const int TbiSizeX86 = 0x1C;
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtQueryInformationThread(
+            IntPtr ThreadHandle,
+            int ThreadInformationClass,
+            byte[] ThreadInformation,
+            int ThreadInformationLength,
+            out int ReturnLength);
+
         [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
         private static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr GetModuleHandleW(string lpModuleName);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr LoadLibraryW(string lpFileName);
@@ -311,6 +335,66 @@ namespace AgileInjector
                 return Environment.Is64BitProcess;
             }
             return !wow64;
+        }
+
+        private static bool TryReadRemoteLastErrorFromTeb(
+            IntPtr hProcess,
+            IntPtr hThread,
+            bool targetIs64Bit,
+            out uint lastError)
+        {
+            lastError = 0;
+            int tbiSize = targetIs64Bit ? TbiSizeX64 : TbiSizeX86;
+            var buf = new byte[tbiSize];
+            int ntStatus = NtQueryInformationThread(
+                hThread,
+                ThreadBasicInformation,
+                buf,
+                buf.Length,
+                out int returnLength);
+            if (ntStatus != 0 || returnLength < (targetIs64Bit ? 16 : 8))
+            {
+                DebugLog.WriteLine($"[Inject][WARN] NtQueryInformationThread(TBI) failed. ntStatus=0x{ntStatus:X} returnLength={returnLength}");
+                return false;
+            }
+
+            IntPtr teb = targetIs64Bit
+                ? new IntPtr(BitConverter.ToInt64(buf, 8))
+                : new IntPtr(BitConverter.ToInt32(buf, 4));
+            if (teb == IntPtr.Zero)
+                return false;
+
+            int lastErrOffset = targetIs64Bit ? 0x68 : 0x34;
+            var errb = new byte[4];
+            if (!ReadProcessMemory(
+                    hProcess,
+                    IntPtr.Add(teb, lastErrOffset),
+                    errb,
+                    4,
+                    out IntPtr nRead) ||
+                nRead.ToInt64() != 4)
+            {
+                int gle = Marshal.GetLastWin32Error();
+                DebugLog.WriteLine($"[Inject][WARN] ReadProcessMemory(TEB.LastErrorValue) failed. gle={gle} ({new Win32Exception(gle).Message}) nRead={nRead}");
+                return false;
+            }
+
+            lastError = BitConverter.ToUInt32(errb, 0);
+            return true;
+        }
+
+        private static string ExplainLoadLibraryFailure(uint win32)
+        {
+            if (win32 == 0)
+                return "Remote LoadLibraryW returned NULL; target thread LastErrorValue=0 (DllMain may have returned FALSE without setting error, or loader did not set Win32 error).";
+            try
+            {
+                return $"Remote LoadLibraryW failure Win32={win32} (0x{win32:X}): {new Win32Exception((int)win32).Message}";
+            }
+            catch
+            {
+                return $"Remote LoadLibraryW failure Win32={win32} (0x{win32:X})";
+            }
         }
 
         // compute remote proc address via RVA from local load
@@ -552,6 +636,172 @@ namespace AgileInjector
                 try { if (hThreadLoad != IntPtr.Zero) { _ = CloseHandle(hThreadLoad); } } catch { }
                 try { if (remoteBuf != IntPtr.Zero) { _ = VirtualFreeEx(hProc, remoteBuf, 0, MEM_RELEASE); } } catch { }
                 try { if (hProc != IntPtr.Zero) { _ = CloseHandle(hProc); DebugLog.WriteLine("[Inject] Closed process handle."); } } catch { }
+            }
+        }
+
+        /// <summary>
+        /// Browser injector path.
+        ///
+        /// LoadLibrary is done QWC wcdc style (local kernel32!LoadLibraryW pointer).
+        /// After load, we call the DLL's exported StartWatch(hwnd) so Agile's DLL actually starts its hooks.
+        /// </summary>
+        [CLSCompliant(false)]
+        public static bool InjectBrowser(uint pid, IntPtr hwndTarget, string dllName)
+        {
+            DebugLog.WriteLine($"[InjectBrowser] Start -> pid={pid}, hwnd=0x{hwndTarget.ToInt64():X}, dll={dllName}");
+
+            // resolve dll path (same convention as Inject)
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            string dllFullPath = Path.Combine(baseDir, "x64", dllName);
+            string dllFullPathNorm = NormalizeFullPath(dllFullPath);
+
+            DebugLog.WriteLine("[InjectBrowser] Using co-located DLL: " + dllFullPath);
+            if (!File.Exists(dllFullPath))
+            {
+                DebugLog.WriteLine("[InjectBrowser][ERROR] DLL file not found next to exe: " + dllFullPath);
+                return false;
+            }
+
+            if (!EnableSeDebug(out string enableErr))
+                DebugLog.WriteLine("[InjectBrowser][WARN] EnableSeDebug failed: " + enableErr);
+
+            IntPtr hProc = IntPtr.Zero;
+            IntPtr remoteBuf = IntPtr.Zero;
+            IntPtr hThreadLoad = IntPtr.Zero;
+
+            try
+            {
+                hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, false, pid);
+                if (hProc == IntPtr.Zero)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    DebugLog.WriteLine($"[InjectBrowser][ERROR] OpenProcess failed. GetLastError={err} ({new Win32Exception(err).Message})");
+                    return false;
+                }
+
+                bool targetIs64 = IsTarget64Bit(hProc);
+                DebugLog.WriteLine($"[InjectBrowser] targetIs64={targetIs64}, injectorIs64={Environment.Is64BitProcess}");
+                if (targetIs64 != Environment.Is64BitProcess)
+                {
+                    DebugLog.WriteLine("[InjectBrowser][ERROR] Bitness mismatch. Injector must match target process bitness (x86/x64).");
+                    return false;
+                }
+
+                // (wcdc) allocate + write DLL path
+                byte[] pathBytes = Encoding.Unicode.GetBytes(dllFullPath + "\0");
+                uint size = (uint)pathBytes.Length;
+                remoteBuf = VirtualAllocEx(hProc, IntPtr.Zero, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (remoteBuf == IntPtr.Zero)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    DebugLog.WriteLine($"[InjectBrowser][ERROR] VirtualAllocEx failed. GetLastError={err} ({new Win32Exception(err).Message})");
+                    return false;
+                }
+
+                if (!WriteProcessMemory(hProc, remoteBuf, pathBytes, size, out uint written) || written != size)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    DebugLog.WriteLine($"[InjectBrowser][ERROR] WriteProcessMemory failed. written={written}/{size} GetLastError={err} ({new Win32Exception(err).Message})");
+                    return false;
+                }
+
+                // QWC wcdc style: local kernel32 + local LoadLibraryW pointer
+                IntPtr hK32 = GetModuleHandleW("kernel32.dll");
+                if (hK32 == IntPtr.Zero)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    DebugLog.WriteLine($"[InjectBrowser][ERROR] GetModuleHandle(kernel32.dll) failed. GetLastError={err} ({new Win32Exception(err).Message})");
+                    return false;
+                }
+
+                IntPtr pLLW = GetProcAddress(hK32, "LoadLibraryW");
+                if (pLLW == IntPtr.Zero)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    DebugLog.WriteLine($"[InjectBrowser][ERROR] GetProcAddress(LoadLibraryW) failed. GetLastError={err} ({new Win32Exception(err).Message})");
+                    return false;
+                }
+
+                hThreadLoad = CreateRemoteThread(hProc, IntPtr.Zero, 0, pLLW, remoteBuf, 0, out uint tid);
+                if (hThreadLoad == IntPtr.Zero)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    DebugLog.WriteLine($"[InjectBrowser][ERROR] CreateRemoteThread(LoadLibraryW) failed. GetLastError={err} ({new Win32Exception(err).Message})");
+                    return false;
+                }
+
+                uint wait = WaitForSingleObject(hThreadLoad, 10000);
+                DebugLog.WriteLine($"[InjectBrowser] WaitForSingleObject(LoadLibrary) -> {wait}, tid={tid}");
+
+                if (!GetExitCodeThread(hThreadLoad, out uint exitRaw))
+                {
+                    int ge = Marshal.GetLastWin32Error();
+                    DebugLog.WriteLine($"[InjectBrowser][WARN] GetExitCodeThread(LoadLibrary) failed. {ge} ({new Win32Exception(ge).Message})");
+                    return false;
+                }
+
+                DebugLog.WriteLine($"[InjectBrowser] LoadLibrary thread exit code: 0x{exitRaw:X}");
+                if (exitRaw == 0)
+                {
+                    uint remoteErr;
+                    if (TryReadRemoteLastErrorFromTeb(hProc, hThreadLoad, targetIs64, out remoteErr))
+                        DebugLog.WriteLine("[InjectBrowser][ERROR] " + ExplainLoadLibraryFailure(remoteErr));
+                    else
+                    {
+                        DebugLog.WriteLine("[InjectBrowser][ERROR] LoadLibraryW returned NULL (could not read remote LastErrorValue).");
+                    }
+                    return false;
+                }
+
+                // StartWatch phase (Agile DLL startup contract)
+                IntPtr hModRemote = RetryFindInjectedModule(hProc, dllFullPathNorm, retries: 12, delayMs: 50);
+                if (hModRemote == IntPtr.Zero)
+                {
+                    DebugLog.WriteLine("[InjectBrowser][ERROR] DLL loaded but could not be located in remote modules for StartWatch.");
+                    return false;
+                }
+
+                IntPtr pStartWatchRemote = ComputeRemoteProcByRva(dllFullPath, hModRemote, "StartWatch");
+                if (pStartWatchRemote == IntPtr.Zero)
+                {
+                    DebugLog.WriteLine("[InjectBrowser][ERROR] Could not compute remote address of StartWatch.");
+                    return false;
+                }
+
+                DebugLog.WriteLine($"[InjectBrowser] StartWatch remote addr=0x{pStartWatchRemote.ToInt64():X}");
+
+                IntPtr hThreadSW = CreateRemoteThread(hProc, IntPtr.Zero, 0, pStartWatchRemote, hwndTarget, 0, out uint tidSW);
+                if (hThreadSW == IntPtr.Zero)
+                {
+                    int errSW = Marshal.GetLastWin32Error();
+                    DebugLog.WriteLine($"[InjectBrowser][ERROR] CreateRemoteThread(StartWatch) failed. GetLastError={errSW} ({new Win32Exception(errSW).Message})");
+                    return false;
+                }
+
+                try
+                {
+                    uint waitSW = WaitForSingleObject(hThreadSW, INFINITE);
+                    if (GetExitCodeThread(hThreadSW, out uint startRet))
+                        DebugLog.WriteLine($"[InjectBrowser] StartWatch returned={startRet}, wait={waitSW}, tid={tidSW}");
+                }
+                finally
+                {
+                    try { _ = CloseHandle(hThreadSW); } catch { }
+                }
+
+                DebugLog.WriteLine($"[InjectBrowser] into pid={pid} -> OK (hMod=0x{exitRaw:X})");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                DebugLog.WriteLine("[InjectBrowser][FATAL] Exception: " + ex);
+                return false;
+            }
+            finally
+            {
+                try { if (hThreadLoad != IntPtr.Zero) _ = CloseHandle(hThreadLoad); } catch { }
+                try { if (remoteBuf != IntPtr.Zero) _ = VirtualFreeEx(hProc, remoteBuf, 0, MEM_RELEASE); } catch { }
+                try { if (hProc != IntPtr.Zero) _ = CloseHandle(hProc); } catch { }
             }
         }
     }

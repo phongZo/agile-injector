@@ -1,4 +1,4 @@
-﻿using Newtonsoft.Json;
+using Newtonsoft.Json;
 using System;
 using System.IO.Pipes;
 using System.Text;
@@ -17,6 +17,7 @@ namespace AgileInjector
         public string TargetProcessId { get; set; }
         public IntPtr TargetHwnd { get; set; }
         public string DllName { get; set; }
+        public bool IsBrowser { get; set; }
     }
 
     public class IpcHandler
@@ -106,10 +107,17 @@ namespace AgileInjector
 
                         try
                         {
-                            bool result = Injector.Inject(targetPid, hwndFilter, msg.DllName);
-                            DebugLog.WriteLine(result
-                                ? "[Injector64.StartServer] Inject OK."
-                                : "[Injector64.StartServer] Inject FAILED.");
+                            bool result;
+                            if (msg.IsBrowser)
+                            {
+                                result = Injector.InjectBrowser(targetPid, hwndFilter, msg.DllName);
+                            } else
+                            {
+                                result = Injector.Inject(targetPid, hwndFilter, msg.DllName);
+                            }
+                                DebugLog.WriteLine(result
+                                    ? "[Injector64.StartServer] Inject OK."
+                                    : "[Injector64.StartServer] Inject FAILED.");
                         }
                         catch (Exception ex)
                         {
