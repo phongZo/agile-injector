@@ -499,46 +499,6 @@ namespace AgileInjector
                     DebugLog.WriteLine($"[Inject] DLL loaded in remote. hModRemote=0x{hModRemote.ToInt64():X}");
                 }
 
-                // 3) compute StartWatch address (RVA method)
-                IntPtr pStartWatchRemote = ComputeRemoteProcByRva(dllFullPath, hModRemote, "StartWatch");
-                if (pStartWatchRemote == IntPtr.Zero)
-                {
-                    DebugLog.WriteLine("[Inject][ERROR] Could not compute remote address of StartWatch.");
-                    return false;
-                }
-                DebugLog.WriteLine($"[Inject] StartWatch remote addr=0x{pStartWatchRemote.ToInt64():X}");
-
-                // optional: verify HWND ownership
-                if (hwndTarget != IntPtr.Zero)
-                {
-                    _ = GetWindowThreadProcessId(hwndTarget, out uint ownerPid);
-                    if (ownerPid != pid)
-                    {
-                        DebugLog.WriteLine($"[Inject][WARN] HWND(0x{hwndTarget.ToInt64():X}) belongs to pid={ownerPid}, not target pid={pid}. StartWatch may fail.");
-                    }
-                }
-
-                // create remote thread to call StartWatch(hwndTarget)
-                IntPtr hThreadSW = CreateRemoteThread(hProc, IntPtr.Zero, 0, pStartWatchRemote, hwndTarget, 0, out uint tidSW);
-                if (hThreadSW == IntPtr.Zero)
-                {
-                    int errSW = Marshal.GetLastWin32Error();
-                    DebugLog.WriteLine($"[Inject][ERROR] CreateRemoteThread(StartWatch) failed. GetLastError={errSW} ({new Win32Exception(errSW).Message})");
-                    return false;
-                }
-
-                uint waitSW = WaitForSingleObject(hThreadSW, INFINITE);
-                if (!GetExitCodeThread(hThreadSW, out uint startRet))
-                {
-                    int errEC = Marshal.GetLastWin32Error();
-                    DebugLog.WriteLine($"[Inject][WARN] GetExitCodeThread(StartWatch) failed. {errEC} ({new Win32Exception(errEC).Message})");
-                }
-                else
-                {
-                    DebugLog.WriteLine($"[Inject] StartWatch returned={startRet}, wait={waitSW}, tid={tidSW}");
-                }
-                try { _ = CloseHandle(hThreadSW); } catch { }
-
                 DebugLog.WriteLine($"[Inject] into pid={pid} -> OK (alreadyLoaded={alreadyLoaded})");
                 return true;
             }
