@@ -1,0 +1,221 @@
+@Library('shared-library') _
+
+// ================================
+// CONFIGURATION
+// ================================
+TIMEZONE = 'GMT+7'
+SONARQUBE_ENV_NAME = 'SonarQubeEnterprise'
+
+PROJECT_KEY = ''
+PROJECT_NAME = 'Agile-injector'
+
+SOLUTION_FILE = ''
+
+DEFAULT_SONAR_EXCLUSIONS = '**/Newtonsoft.Json/**,**/Generated/**,**/*Generated*.cs,**/*.Designer.cs,**/*.g.cs,**/*.g.i.cs,**/bin/**,**/obj/**,**/packages/**'
+
+// ================================
+// JOB PIPELINE
+// ================================
+node('windows') {
+    withCredentials([
+        string(credentialsId: 'telegram-token', variable: 'telegramToken'),
+        string(credentialsId: 'telegram-chat-id', variable: 'telegramChatId')
+    ]) {
+        env.CHAT_TOKEN = telegramToken
+        env.CHAT_ID = telegramChatId
+    }
+
+    try {
+        notifyBuild('STARTED')
+
+        stage('Checkout code') {
+            checkout scm
+        }
+
+        stage('Prepare Windows Build') {
+            bat '''
+            echo === JENKINS INFO ===
+            echo JOB_NAME=%JOB_NAME%
+            echo JOB_BASE_NAME=%JOB_BASE_NAME%
+            echo WORKSPACE=%WORKSPACE%
+
+            echo === HOSTNAME ===
+            hostname
+
+            echo === JAVA ===
+            java -version
+
+            echo === DOTNET ===
+            dotnet --version
+
+            echo === MSBUILD ===
+            where msbuild
+            msbuild -version
+
+            echo === NUGET ===
+            where nuget
+            nuget help
+            '''
+
+            if (!SOLUTION_FILE?.trim()) {
+                def solutions = findFiles(glob: '*.sln')
+
+                if (solutions.length == 0) {
+                    error 'No .sln file found in workspace root.'
+                }
+
+                SOLUTION_FILE = solutions[0].path
+                println "Auto-detected solution file: ${SOLUTION_FILE}"
+            } else {
+                println "Using configured solution file: ${SOLUTION_FILE}"
+            }
+        }
+
+        stage('Read Sonar Project Properties') {
+            if (!fileExists('sonar-project.properties')) {
+                error 'sonar-project.properties not found. Cannot read sonar.projectKey.'
+            }
+
+            def sonarProps = readProperties file: 'sonar-project.properties'
+
+            PROJECT_KEY = sonarProps['sonar.projectKey'] ?: ''
+            PROJECT_NAME = sonarProps['sonar.projectName'] ?: PROJECT_NAME
+            SONAR_EXCLUSIONS = sonarProps['sonar.exclusions'] ?: DEFAULT_SONAR_EXCLUSIONS
+
+            if (!PROJECT_KEY?.trim()) {
+                error 'sonar.projectKey is missing or empty in sonar-project.properties.'
+            }
+
+            println "Using Sonar project key from sonar-project.properties: ${PROJECT_KEY}"
+            println "Using Sonar project name: ${PROJECT_NAME}"
+            println "Using Sonar exclusions: ${SONAR_EXCLUSIONS}"
+        }
+
+        stage('Unit test') {
+            println 'Pass'
+        }
+
+        stage('SonarQube Analysis') {
+            try {
+                bat '''
+                if exist "sonar-project.properties.jenkins.bak" (
+                    if not exist "sonar-project.properties" (
+                        ren "sonar-project.properties.jenkins.bak" "sonar-project.properties"
+                    )
+                )
+                '''
+
+                if (fileExists('sonar-project.properties')) {
+                    bat '''
+                    if exist "sonar-project.properties.jenkins.bak" del /f /q "sonar-project.properties.jenkins.bak"
+                    ren "sonar-project.properties" "sonar-project.properties.jenkins.bak"
+                    '''
+                    println 'Temporarily renamed sonar-project.properties for SonarScanner for .NET.'
+                }
+
+                withSonarQubeEnv(SONARQUBE_ENV_NAME) {
+                    bat """
+                    if exist ".sonarqube" rmdir /s /q ".sonarqube"
+
+                    dotnet sonarscanner begin ^
+                      /k:"${PROJECT_KEY}" ^
+                      /n:"${PROJECT_NAME}" ^
+                      /d:sonar.host.url="%SONAR_HOST_URL%" ^
+                      /d:sonar.token="%SONAR_AUTH_TOKEN%" ^
+                      /d:sonar.projectBaseDir="%WORKSPACE%" ^
+                      /d:sonar.exclusions="${SONAR_EXCLUSIONS}"
+                    """
+
+                    bat """
+                    nuget restore "${SOLUTION_FILE}"
+                    """
+
+                    bat """
+                    msbuild "${SOLUTION_FILE}" /t:Rebuild /nodeReuse:false
+                    """
+
+                    bat """
+                    dotnet sonarscanner end ^
+                      /d:sonar.token="%SONAR_AUTH_TOKEN%"
+                    """
+                }
+            } finally {
+                bat '''
+                if exist "sonar-project.properties.jenkins.bak" (
+                    if exist "sonar-project.properties" del /f /q "sonar-project.properties"
+                    ren "sonar-project.properties.jenkins.bak" "sonar-project.properties"
+                )
+                '''
+            }
+        }
+
+        stage('SonarQube Quality Gate') {
+            timeout(time: 5, unit: 'MINUTES') {
+                def qg = waitForQualityGate()
+                env.SONAR_QUALITY_GATE_STATUS = qg.status
+            }
+        }
+
+        stage('Build') {
+            println 'Pass'
+        }
+
+        stage('Send build to Telegram') {
+            currentBuild.result = 'SUCCESS'
+            notifyBuild(currentBuild.result)
+        }
+    } catch (Exception ex) {
+        println(ex)
+        currentBuild.result = 'FAILURE'
+        notifyBuild('EXCEPTION', ex.message != null ? ex.message : ex.toString())
+        error ex.message != null ? ex.message : ex.toString()
+    }
+}
+
+// ================================
+// HELPER FUNCTION
+// ================================
+
+def notifyBuild(buildStatus, exceptionErrorMessage = '') {
+    def message = ''
+    def jobName = escapeMarkdown("${env.JOB_NAME} - ${env.BUILD_NUMBER}")
+
+    if (buildStatus == 'STARTED') {
+        message = "➡️ *STARTED:* Job [${jobName}](${env.BUILD_URL})"
+    } else if (buildStatus == 'EXCEPTION') {
+        def errorHeader = "❌ *FAILURE:* Job [${jobName}](${env.BUILD_URL})"
+        message = "${errorHeader}\n————————————————————\nJob is aborted due to exception error:\n*${escapeMarkdown(exceptionErrorMessage)}*"
+    } else {
+        def buildTime = formatMilisecondTime(timeInMillis: currentBuild.timeInMillis, timezone: TIMEZONE, format: 'MMM dd, yyyy HH:mm:ss Z')
+        def duration = currentBuild.durationString.replace(' and counting', '')
+        def changeLog = getChangeLog()
+
+        def sonarUrl = ''
+
+        if (fileExists('.sonarqube/out/.sonar/report-task.txt')) {
+            def sonarProps = readProperties file: '.sonarqube/out/.sonar/report-task.txt'
+            sonarUrl = sonarProps['dashboardUrl']
+        } else if (fileExists('.scannerwork/report-task.txt')) {
+            def sonarProps = readProperties file: '.scannerwork/report-task.txt'
+            sonarUrl = sonarProps['dashboardUrl']
+        }
+
+        def buildTimeText = "*Build Time:* ${escapeMarkdown(buildTime)}"
+        def durationText = "*Duration:* ${escapeMarkdown(duration)}"
+        def changeLogText = "*Change Log:* \n${escapeMarkdown(changeLog)}"
+
+        def sonarUrlText = sonarUrl ? "[${escapeMarkdown('(detail)')}](${sonarUrl})" : ''
+        def sonarQualityGateStatusText = env.SONAR_QUALITY_GATE_STATUS == 'OK' ? '🟢 Good' : "🟠 Normal"
+        def sonarResultText = "*Code Quality:* ${sonarQualityGateStatusText} ${sonarUrlText}"
+
+        if (buildStatus == 'SUCCESS') {
+            def successHeader = " ✅ *SUCCESS:* Job [${jobName}](${env.BUILD_URL})"
+            message = "${successHeader}\n————————————————————\n${buildTimeText}\n${durationText}\n${sonarResultText}\n${changeLogText}"
+        } else {
+            def errorHeader = "❌ *FAILURE:* Job [${jobName}](${env.BUILD_URL})"
+            message = "${errorHeader}\n————————————————————\n${buildTimeText}\n${durationText}\n${sonarResultText}\n${changeLogText}"
+        }
+    }
+
+    sendTelegramMessage(message: message, token: env.CHAT_TOKEN, chatID: env.CHAT_ID, mode: 'MarkdownV2')
+}

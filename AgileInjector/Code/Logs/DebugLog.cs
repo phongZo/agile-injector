@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -13,6 +14,7 @@ namespace AgileInjector
         private static StreamWriter StreamWriter;
         public static string Folder = "";
         private static bool CanWrite = true;
+        private static readonly ConcurrentDictionary<string, string> LastMessageByKey = new ConcurrentDictionary<string, string>();
 
 
         public static void Init()
@@ -135,6 +137,20 @@ namespace AgileInjector
             }
 
             StreamWriter.WriteLine(message);
+        }
+
+        // Only writes to the log if `message` differs from the last message logged under `key`.
+        // Use this for IPC send/receive logging, which otherwise repeats identically on every poll/tick.
+        public static void WriteLineIfChanged(string key, string message, bool timestamp = true)
+        {
+            if (DebugLog.CanWrite == false)
+            {
+                return;
+            }
+
+            if (LastMessageByKey.TryGetValue(key, out string last) && last == message) return;
+            LastMessageByKey[key] = message;
+            WriteLine(message, timestamp);
         }
         public static void ResetPermissionOfFile(string fullFilename)
         {

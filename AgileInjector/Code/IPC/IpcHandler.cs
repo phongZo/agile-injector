@@ -1,13 +1,15 @@
-﻿using Newtonsoft.Json;
+using Newtonsoft.Json;
 using System;
 using System.IO.Pipes;
 using System.Text;
+using System.Threading;
 
 namespace AgileInjector
 {
     public static class AgileSharingConstants
     {
         public const string CMD_INJECT_DLL = "InjectDLL";
+        public const string CMD_WEBCAM_STATUS = "WebcamStatus";
     }
 
     public class DLLMessageWrapper
@@ -17,6 +19,8 @@ namespace AgileInjector
         public string TargetProcessId { get; set; }
         public IntPtr TargetHwnd { get; set; }
         public string DllName { get; set; }
+        public bool IsBrowser { get; set; }
+        public bool WebcamWithWatermark { get; set; }
     }
 
     public class IpcHandler
@@ -30,12 +34,13 @@ namespace AgileInjector
         #endregion
 
         public int? AgileMarkProcessId { get; set; }
+        public bool LastWebcamWithWatermark { get; set; } = true;
 
-        public void StartServer()
+        public void StartServer(CancellationToken ct = default)
         {
             const string pipeName = "agileinject64_qaKOab5VPyK4ar4A6sfm2VZ0";
 
-            while (true)
+            while (!ct.IsCancellationRequested)
             {
                 using (NamedPipeServerStream pipeServer = new NamedPipeServerStream(
                     pipeName,
@@ -53,7 +58,7 @@ namespace AgileInjector
                         try { pipeServer.ReadMode = PipeTransmissionMode.Message; } catch { }
 
                         string received = ReadFullMessage(pipeServer);
-                        DebugLog.WriteLine($"[Injector64.StartServer] Raw message: [{received}]");
+                        DebugLog.WriteLineIfChanged("IPC:Receive:AgileService", $"[Injector64.StartServer] Raw message: [{received}]");
 
                         if (string.IsNullOrWhiteSpace(received))
                         {
@@ -78,14 +83,21 @@ namespace AgileInjector
                             continue;
                         }
 
+                        // remember sender pid if present
+                        try { AgileMarkProcessId = msg.SenderProcessId; } catch { }
+
+                        if (string.Equals(msg.CMD, AgileSharingConstants.CMD_WEBCAM_STATUS, StringComparison.OrdinalIgnoreCase))
+                        {
+                            LastWebcamWithWatermark = msg.WebcamWithWatermark;
+                            DebugLog.WriteLineIfChanged("IPC:Receive:AgileService:WebcamStatus", $"[Injector64.StartServer] WebcamStatus received: WebcamWithWatermark={msg.WebcamWithWatermark}");
+                            continue;
+                        }
+
                         if (!string.Equals(msg.CMD, AgileSharingConstants.CMD_INJECT_DLL, StringComparison.OrdinalIgnoreCase))
                         {
                             DebugLog.WriteLine($"[Injector64.StartServer] Unknown CMD: {msg.CMD}");
                             continue;
                         }
-
-                        // remember sender pid if present
-                        try { AgileMarkProcessId = msg.SenderProcessId; } catch { }
 
                         if (!uint.TryParse(msg.TargetProcessId, out uint targetPid))
                         {
@@ -106,10 +118,17 @@ namespace AgileInjector
 
                         try
                         {
-                            bool result = Injector.Inject(targetPid, hwndFilter, msg.DllName);
-                            DebugLog.WriteLine(result
-                                ? "[Injector64.StartServer] Inject OK."
-                                : "[Injector64.StartServer] Inject FAILED.");
+                            bool result;
+                            if (msg.IsBrowser)
+                            {
+                                result = Injector.InjectBrowser(targetPid, hwndFilter, msg.DllName);
+                            } else
+                            {
+                                result = Injector.Inject(targetPid, hwndFilter, msg.DllName);
+                            }
+                                DebugLog.WriteLine(result
+                                    ? "[Injector64.StartServer] Inject OK."
+                                    : "[Injector64.StartServer] Inject FAILED.");
                         }
                         catch (Exception ex)
                         {

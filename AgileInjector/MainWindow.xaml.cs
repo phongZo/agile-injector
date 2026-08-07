@@ -36,6 +36,9 @@ namespace AgileInjector
             DebugLog.Write("AgileInjector Client Version " + System.Windows.Forms.Application.ProductVersion);
             LogRotateTimer = new BackgroundTimer(LogRotateTimerCallback, "log rotation");
 
+            Timer.StopIfRunning();
+            Timer.Start(2);
+
             Task.Run(() => IpcHandler.Instance.StartServer());
         }
         private void LogRotateTimerCallback()
@@ -58,6 +61,17 @@ namespace AgileInjector
         }
 
 
+        private static readonly string[] TargetMeetingApps = { "zoom", "ms-teams", "ciscocollabhost" };
+
+        private static bool IsTargetMeetingAppRunning()
+        {
+            foreach (var appName in TargetMeetingApps)
+            {
+                if (Process.GetProcessesByName(appName).Length > 0) return true;
+            }
+            return false;
+        }
+
         private static void HandleCheckAgentRunning()
         {
             if (IpcHandler.Instance.AgileMarkProcessId.HasValue)
@@ -68,6 +82,7 @@ namespace AgileInjector
                     DebugLog.Write("Not found AgileMark -> exit Injector64");
                     Application.Current.Shutdown();
                     Environment.Exit(0);
+                    return;
                 }
             }
             else
@@ -77,7 +92,15 @@ namespace AgileInjector
                 {
                     DebugLog.Write("AgileMark not running -> exit Injector64");
                     Application.Current.Shutdown();
+                    return;
                 }
+            }
+
+            if (!IpcHandler.Instance.LastWebcamWithWatermark || !IsTargetMeetingAppRunning())
+            {
+                DebugLog.Write("Webcam flag off or no meeting app running -> exit Injector64");
+                Application.Current.Shutdown();
+                Environment.Exit(0);
             }
         }
     }
